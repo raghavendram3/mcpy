@@ -12,6 +12,7 @@ It does **not** import `mcpy`. All it needs is `ase`, `numpy`, `scipy` and
 | --- | --- |
 | `ptnimo_gcmc.py` | The whole code, about 600 lines. Run it as a script or import `Config` and `GCMC`. |
 | `PtNiMo_GCMC_colab.ipynb` | A Colab notebook. It installs MACE, mounts Google Drive, writes the script into the VM, runs it and plots the results. |
+| `PtNiMo_5nm_ORR_colab.ipynb` | The same workflow for a 5 nm-edge octahedron (4579 atoms) at Pt:Ni:Mo = 72:14:14 under ORR conditions (0.90 V vs RHE, 298 K). It uses the faster move set described below. Needs an A100 or L4. |
 | `make_notebook.py` | Regenerates the notebook from the script after you edit the script. |
 
 ## Running it on Colab
@@ -68,6 +69,21 @@ python ptnimo_gcmc.py --config my_settings.json --out run1   # any Config field 
     (2.6 Å) above its facets. Set `shell_depth > 0` to allow subsurface O.
   - Points within `r_excl_metal` of a metal atom or `r_excl_O` of an O atom are excluded.
   - V is measured on a fixed set of sample points, so it is an exact function of the structure.
+
+## Options added for large particles and electrochemistry
+
+- **`octahedron_edge_nm`** sets the particle size by edge length. For example, 5.0
+  gives Octahedron length 19: 4579 atoms with a 4.93 nm edge.
+- **`potential_V_RHE`** puts O in equilibrium with water at that potential
+  (computational hydrogen electrode). `mu_O_reference` picks how μ_O is evaluated:
+  - `'H2O'`: G(H₂O) − G(H₂) + 2eU, using MACE energies.
+  - `'O2'`: ½E(O₂) + Δμ_O(T, 1 atm) + 2e(U − 1.229 V).
+
+  Both values are logged, with a warning when they differ by more than 0.3 eV.
+- **`swap_depth`** (Å): only metal atoms within this depth below the surface take
+  part in swaps. 3.5 Å covers the surface and first subsurface layer.
+- **`move_weights`**: `insert` and `delete` must be equal, and the code refuses
+  unequal values. The acceptance rules assume both are proposed equally often.
 
 ## Output files (in `out_dir`)
 

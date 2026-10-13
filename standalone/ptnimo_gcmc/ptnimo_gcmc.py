@@ -17,13 +17,30 @@ E(O2) is computed with the same potential, so only DELTA_MU_O(T, p_O2) is
 a physical knob. Give it directly, or let it be computed from (T, p_O2) with
 the JANAF-based table of Reuter & Scheffler, PRB 65, 035406 (2001).
 
+For electrochemical conditions (e.g. the oxygen reduction reaction) give
+``potential_V_RHE`` instead. O is then in equilibrium with water at that
+potential (computational hydrogen electrode, Norskov et al., JPCB 108,
+17886 (2004)), and ``mu_O_reference`` picks how mu_O is evaluated:
+
+    'H2O': mu_O = G(H2O) - G(H2) + 2 e U      (no O2 energy needed)
+    'O2' : mu_O = E(O2)/2 + Delta mu_O(T, 1 atm) + 2 e (U - 1.229 V)
+
+Both are computed and logged; they differ by the potential's error on the
+water formation energy, chiefly the GGA O2 overbinding.
+
 Moves (one trial per MC step, chosen by weight):
 
 * ``insert``  - O at a uniform random point of the free adsorption shell
 * ``delete``  - a random O in the shell
 * ``displace``- random O shifted by up to ``displace_max`` A
 * ``swap``    - exchange two metal atoms of different species (Pt<->Ni,
-                Pt<->Mo, Ni<->Mo), so O can drive surface segregation
+                Pt<->Mo, Ni<->Mo), so O can drive surface segregation.
+                With ``swap_depth`` set, only metal atoms within that depth
+                below the surface take part (interior swaps change nothing
+                O can see and cost a full trial each).
+
+The ``insert`` and ``delete`` weights must be equal: the acceptance rules
+below assume both are proposed equally often.
 
 Every trial structure is relaxed (FIRE) before its energy is used: the
 hybrid relaxed-trial GCMC of Senftle et al. Relaxation is local by default:
@@ -90,6 +107,12 @@ DELTA_MU_O_TABLE = {
 }
 
 
+# Computational hydrogen electrode: ZPE - TS (eV) at 298 K, Norskov et al.,
+# JPCB 108, 17886 (2004). H2O(l) is taken as the gas at 0.035 bar.
+ZPE_MINUS_TS = {"H2O": 0.56 - 0.67, "H2": 0.27 - 0.41}
+EQUILIBRIUM_POTENTIAL_V = 1.229   # O2 + 4(H+ + e-) <-> 2 H2O
+
+
 def delta_mu_O_from_pressure(temperature: float, p_O2_atm: float) -> float:
     """Delta mu_O(T, p) = Delta mu_O(T, p0) + 1/2 kT ln(p / p0)."""
     ts = sorted(DELTA_MU_O_TABLE)
@@ -104,6 +127,7 @@ def delta_mu_O_from_pressure(temperature: float, p_O2_atm: float) -> float:
 class Config:
     # --- nanoparticle -------------------------------------------------------
     octahedron_length: int = 9          # (9, 0) -> 489 atoms
+    octahedron_edge_nm: Optional[float] = None  # set: overrides length (19 -> 4.93 nm)
     octahedron_cutoff: int = 0          # corner truncation
     lattice_constant: float = 3.87      # A, ~Pt3Ni; relaxed away at start
     composition: dict = field(default_factory=lambda: {
@@ -113,8 +137,10 @@ class Config:
 
     # --- thermodynamics -----------------------------------------------------
     temperature: float = 300.0          # K
-    delta_mu_O: Optional[float] = None  # eV; None -> from (T, p_O2_atm)
+    delta_mu_O: Optional[float] = None  # eV; None -> from potential or (T, p_O2_atm)
     p_O2_atm: float = 1.0
+    potential_V_RHE: Optional[float] = None  # electrochemical: O in equilibrium with H2O at U
+    mu_O_reference: str = "H2O"         # with potential_V_RHE: 'H2O' or 'O2' route
     mu_O_correction: float = 0.0        # eV per O, e.g. GGA O2 overbinding
 
     # --- potential ----------------------------------------------------------
@@ -134,6 +160,7 @@ class Config:
     move_weights: dict = field(default_factory=lambda: {
         "insert": 1.0, "delete": 1.0, "displace": 0.5, "swap": 0.5})
     displace_max: float = 0.7           # A
+    swap_depth: Optional[float] = None  # A below the surface; None = whole particle
     shell_height: float = 2.6           # A above the metal hull facets
     shell_depth: float = 0.0            # A below them (>0: subsurface O)
     r_excl_metal: float = 1.6           # A, no O inserted closer to a metal
@@ -181,7 +208,12 @@ def build_nanoparticle(cfg: Config, rng: np.random.Generator) -> Atoms:
     """Octahedron with the requested composition. Mo goes to the lowest
     coordinated sites (vertices, then edges) for ``mo_placement='surface'``,
     as found for Mo-Pt3Ni octahedra; Ni is distributed randomly."""
-    atoms = Octahedron("Pt", length=cfg.octahedron_length,
+    length = cfg.octahedron_length
+    if cfg.octahedron_edge_nm is not None:
+        # an edge of `length` atoms spans (length - 1) nearest-neighbour gaps
+        length = 1 + int(round(10 * cfg.octahedron_edge_nm
+                               / (cfg.lattice_constant / math.sqrt(2))))
+    atoms = Octahedron("Pt", length=length,
                        cutoff=cfg.octahedron_cutoff,
                        latticeconstant=cfg.lattice_constant)
     n = len(atoms)
@@ -302,6 +334,9 @@ class GCMC:
         lam = units._hplanck / math.sqrt(2 * math.pi * mass * units._k * T) * 1e10
         self.lambda3 = lam ** 3                                   # A^3
 
+        if cfg.move_weights.get("insert", 0) != cfg.move_weights.get("delete", 0):
+            raise ValueError("move_weights: 'insert' and 'delete' must be equal "
+                             "(the acceptance rules assume it)")
         self.moves = [m for m, w in cfg.move_weights.items() if w > 0]
         w = np.array([cfg.move_weights[m] for m in self.moves], dtype=float)
         self.move_p = w / w.sum()
@@ -319,11 +354,12 @@ class GCMC:
 
     def _fresh_start(self):
         cfg = self.cfg
-        if cfg.delta_mu_O is None:
+        self.half_E_O2 = 0.5 * self._molecule_energy("O2")
+        if cfg.potential_V_RHE is not None and cfg.delta_mu_O is None:
+            mu = self._electrochemical_mu_O(cfg.potential_V_RHE)
+            cfg.delta_mu_O = mu - self.half_E_O2
+        elif cfg.delta_mu_O is None:
             cfg.delta_mu_O = delta_mu_O_from_pressure(cfg.temperature, cfg.p_O2_atm)
-        o2 = molecule("O2")
-        o2.center(vacuum=8.0)
-        self.half_E_O2 = 0.5 * self._relax(o2, None, 200, 0.01)
         self.mu_O = self.half_E_O2 + cfg.delta_mu_O + cfg.mu_O_correction
 
         if cfg.initial_structure:
@@ -347,6 +383,31 @@ class GCMC:
                  "V_free_A3", "seconds"])
         self._log(f"T = {cfg.temperature} K, Delta mu_O = {cfg.delta_mu_O:.4f} eV, "
                   f"E(O2)/2 = {self.half_E_O2:.4f} eV, mu_O = {self.mu_O:.4f} eV")
+
+    def _molecule_energy(self, name: str) -> float:
+        mol = molecule(name)
+        mol.center(vacuum=8.0)
+        return self._relax(mol, None, 200, 0.01)
+
+    def _electrochemical_mu_O(self, potential: float) -> float:
+        """mu_O for O in equilibrium with H2O at ``potential`` (V vs RHE)."""
+        cfg = self.cfg
+        g_h2o = self._molecule_energy("H2O") + ZPE_MINUS_TS["H2O"]
+        g_h2 = self._molecule_energy("H2") + ZPE_MINUS_TS["H2"]
+        via_h2o = g_h2o - g_h2 + 2.0 * potential
+        via_o2 = (self.half_E_O2 + delta_mu_O_from_pressure(cfg.temperature, 1.0)
+                  + 2.0 * (potential - EQUILIBRIUM_POTENTIAL_V))
+        self._log(f"U = {potential:.3f} V_RHE: mu_O via H2O/H2 = {via_h2o:.4f} eV, "
+                  f"via O2 = {via_o2:.4f} eV (difference {via_h2o - via_o2:+.3f} eV)")
+        if abs(via_h2o - via_o2) > 0.3:
+            self._log("WARNING: the two references disagree by more than 0.3 eV; "
+                      "the potential's water formation energy is off. "
+                      "Check mu_O_reference.")
+        if cfg.mu_O_reference == "H2O":
+            return via_h2o
+        if cfg.mu_O_reference == "O2":
+            return via_o2
+        raise ValueError("mu_O_reference must be 'H2O' or 'O2'")
 
     @property
     def _csv_path(self):
@@ -429,13 +490,18 @@ class GCMC:
 
     def _move_swap(self):
         symbols = np.array(self.atoms.get_chemical_symbols())
-        present = [s for s in METALS if (symbols == s).any()]
+        allowed = np.isin(symbols, METALS)
+        if self.cfg.swap_depth is not None:
+            # depth below the nearest hull facet; set by positions only, so
+            # a swap does not change which atoms may be picked
+            allowed &= self.shell.height(self.atoms.positions) >= -self.cfg.swap_depth
+        present = [s for s in METALS if (allowed & (symbols == s)).any()]
         if len(present) < 2:
             return False, None, None
         pairs = [(a, b) for k, a in enumerate(present) for b in present[k + 1:]]
         a, b = pairs[self.rng.integers(len(pairs))]
-        i = int(self.rng.choice(np.flatnonzero(symbols == a)))
-        j = int(self.rng.choice(np.flatnonzero(symbols == b)))
+        i = int(self.rng.choice(np.flatnonzero(allowed & (symbols == a))))
+        j = int(self.rng.choice(np.flatnonzero(allowed & (symbols == b))))
         trial = self.atoms.copy()
         numbers = trial.numbers.copy()
         numbers[i], numbers[j] = numbers[j], numbers[i]
@@ -599,6 +665,7 @@ def main(argv=None):
     p.add_argument("--config", help="JSON file with Config fields")
     p.add_argument("--delta-mu-O", type=float)
     p.add_argument("--p-O2-atm", type=float)
+    p.add_argument("--potential-V-RHE", type=float)
     p.add_argument("--temperature", type=float)
     p.add_argument("--steps", type=int)
     p.add_argument("--equilibration", type=int)
