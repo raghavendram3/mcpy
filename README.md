@@ -88,12 +88,29 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python your_run.py
 This keeps reserved memory near the true per-step peak; live usage is only ever
 a small model-sized footprint.
 
-### MPI for replica exchange
+### MPI for replica exchange and parallel GCMC
 
 `mpi4py` is not pulled in automatically — install it with conda:
 
 ```sh
 conda install mpi4py
+```
+
+On a supercomputer, build it against the site MPI instead
+(`module load openmpi; pip install --no-binary mpi4py mpi4py`).
+
+### Parallel GCMC on CPU nodes
+
+`ParallelGCMC` runs one GCMC setup at a fixed chemical potential (e.g. a
+nanoparticle under a given oxygen chemical potential) on every core of one or
+more nodes. The MPI ranks are split into independent walkers, and the ranks of
+each walker evaluate trial moves in parallel, keeping the first accepted one in
+rank order -- which samples exactly the serial chain's distribution. See
+`examples/05_parallel_gcmc_nanoparticle.py`, the 192-core SLURM script
+`examples/slurm_parallel_gcmc.sh`, and `docs/parallel_gcmc.rst`.
+
+```sh
+srun -n 192 python examples/05_parallel_gcmc_nanoparticle.py
 ```
 
 ## Dependencies
@@ -106,7 +123,7 @@ Optional:
 
 - `mace-torch>=0.3.9` — MACE calculators (install via `.[mace]`)
 - `nvalchemi-toolkit[mace]>=0.1.0` — GPU-native MACE (install via `.[alchemi]`)
-- `mpi4py>=4.0.3` — replica exchange (install via conda)
+- `mpi4py>=4.0.3` — replica exchange and `ParallelGCMC` (install via conda or against the site MPI)
 
 ## Usage
 

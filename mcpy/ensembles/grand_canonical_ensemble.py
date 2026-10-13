@@ -289,9 +289,12 @@ class GrandCanonicalEnsemble(BaseEnsemble):
             )
         return snapshot, (delta_particles, species)
 
-    def _commit_or_rollback(self, E_new: float, snapshot, meta) -> bool:
-        """Score the pending proposal and either keep it or restore the
-        snapshot. Returns whether it was accepted."""
+    def _is_accepted(self, E_new: float, meta) -> bool:
+        """Acceptance test for the pending proposal. Changes no state other
+        than drawing from the acceptance RNG.
+
+        Split out of :meth:`_commit_or_rollback` so ``ParallelGCMC`` can
+        decide on every rank first and commit only the winning proposal."""
         delta_particles, species = meta
         delta_E = E_new - self.E_old
         volume = self.move_selector.get_volume()
@@ -303,17 +306,28 @@ class GrandCanonicalEnsemble(BaseEnsemble):
         n_exchange = self.move_selector.get_exchange_count()
         if n_exchange is None:
             n_exchange = self.n_atoms
-        if not self._acceptance_condition(delta_E, delta_particles, volume,
-                                          species, n_exchange):
-            self._restore(snapshot)
-            return False
+        return self._acceptance_condition(delta_E, delta_particles, volume,
+                                          species, n_exchange)
 
+    def _commit(self, E_new: float) -> None:
+        """Make the pending (accepted) proposal the current state."""
         if self._wrap_on_accept:
             self.atoms.wrap()
         self.n_atoms = len(self.atoms)
         self.E_old = E_new
-        self.move_selector.acceptance_counter()
         self.calculate_cells_volume(self.atoms)
+
+    def _commit_or_rollback(self, E_new: float, snapshot, meta) -> bool:
+        """Score the pending proposal and either keep it or restore the
+        snapshot. Returns whether it was accepted."""
+        if not self._is_accepted(E_new, meta):
+            self._restore(snapshot)
+            return False
+
+        delta_particles, species = meta
+        volume = self.move_selector.get_volume()
+        self._commit(E_new)
+        self.move_selector.acceptance_counter()
         self._record_minimum(self.atoms, self.E_old)
         self.logger.debug("Volume: %.3f, Delta_particles: %d, Species: %s",
                           volume, delta_particles, species)
