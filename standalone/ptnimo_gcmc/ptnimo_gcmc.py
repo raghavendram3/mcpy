@@ -200,7 +200,20 @@ def make_calculator(cfg: Config):
     kwargs = dict(model=cfg.model, device=resolve_device(cfg.device),
                   default_dtype=cfg.dtype)
     if cfg.enable_cueq:
-        kwargs["enable_cueq"] = True
+        # The cuEquivariance CUDA kernels can be installed yet unloadable
+        # (e.g. libnvrtc of another CUDA version); MACE then crashes on the
+        # first forward pass. Probe with a tiny molecule and fall back.
+        try:
+            calc = mace_mp(**kwargs, enable_cueq=True)
+            probe = molecule("H2O")
+            probe.center(vacuum=5.0)
+            probe.calc = calc
+            probe.get_forces()
+            print("cuEquivariance kernels active", flush=True)
+            return calc
+        except Exception as exc:
+            print(f"cuEquivariance unusable ({type(exc).__name__}: {exc}); "
+                  "using the standard MACE kernels", flush=True)
     return mace_mp(**kwargs)
 
 

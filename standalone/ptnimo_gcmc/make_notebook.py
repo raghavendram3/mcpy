@@ -194,15 +194,21 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 !pip -q install mace-torch
 
 # cuEquivariance kernels: ~2x faster MACE on GPU, worth it at this size.
+# The kernel package must match the CUDA version PyTorch was built with.
+# If they cannot load, CUEQ_OK stays False, and the calculator also checks
+# itself and falls back to the standard kernels, so a bad install never crashes.
 INSTALL_CUEQ = True
 CUEQ_OK = False
 if INSTALL_CUEQ:
-    !pip -q install cuequivariance-torch cuequivariance-ops-torch-cu12
+    import torch
+    CUDA_MAJOR = torch.version.cuda.split(".")[0]      # e.g. "12"
+    print("PyTorch CUDA:", torch.version.cuda)
+    !pip -q install cuequivariance-torch cuequivariance-ops-torch-cu{CUDA_MAJOR}
     try:
-        import cuequivariance_torch  # noqa: F401
+        import cuequivariance_ops_torch  # noqa: F401  (the CUDA kernels themselves)
         CUEQ_OK = True
-    except ImportError:
-        print("cuEquivariance not available; running without it")
+    except Exception as exc:
+        print("cuEquivariance kernels unavailable, running without them:", exc)
 """),
     md("## 2. Output folder on Google Drive"),
     code("""
