@@ -98,3 +98,304 @@ class GrandCanonicalEnsemble(BaseEnsemble):
         self.atoms = state["atoms"]
         self.E_old = state["energy"]
         self.n_atoms = state["n_atoms"]
+        # Step count and exchange statistics are restored only when the dict
+        # carries them, so the get_state()/set_state() restart round-trip is
+        # lossless. ``ReplicaExchange`` strips them before applying a swap:
+        # they describe the *slot*, not the config, and trading them between
+        # ranks made the per-rank "Accepted Exchange (%)" column meaningless.
+        self._step = state.get("step", self._step)
+        self.exchange_attempts = state.get(
+            "exchange_attempts", self.exchange_attempts)
+        self.exchange_successes = state.get(
+            "exchange_successes", self.exchange_successes)
+        # The configuration changed under the cells: refresh their free
+        # volumes now, or the next insertion/deletion acceptance would use
+        # the previous configuration's volume (GCMC only recalculates on
+        # accepted moves).
+        self.calculate_cells_volume(self.atoms)
+
+    def get_outfile_header(self) -> str:
+        return (
+            "+-------------------------------------------------+\n"
+            "| Grand Canonical Ensemble Monte Carlo Simulation |\n"
+            "+-------------------------------------------------+\n\n"
+        )
+
+    def get_outfile_metadata(self) -> str:
+        ratio_label = f"Acceptance Ratios ({', '.join(self.move_selector.move_list_names)})"
+        header_row = "{:<10} {:<10} {:<15} {:<{w}}".format(
+            "Step", "N_atoms", "Energy (eV)", ratio_label,
+            w=self._ratio_col_width,
+        )
+        return (
+            "Simulation Parameters:\n"
+            f"  Units type: {self.units.unit_type}\n"
+            f"  Temperature (K): {self._temperature}\n"
+            f"  Chemical potentials: {self._mu}\n"
+            "  Acceptance ratios are per write-interval (cumulative totals "
+            "in the finalize_run log).\n"
+            "Starting simulation...\n"
+            + header_row
+            + "\n" + "-" * self._table_width + "\n"
+        )
+
+    def _row(self, ratio_str: str) -> str:
+        return "{:<10} {:<10} {:<15.6f} {:<{w}}".format(
+            self._step, self.n_atoms, self.E_old, ratio_str,
+            w=self._ratio_col_width)
+
+    def write_outfile(self, step: int = None, energy: float = None) -> None:
+        """Write one row: step, N, energy, per-interval acceptance ratios.
+
+        ``step``/``energy`` are accepted for compatibility with the
+        :class:`BaseEnsemble` signature but ignored — GCMC always logs its
+        own ``_step``/``E_old`` so the row matches the sampler state.
+        """
+        if self._last_logged_step == self._step:
+            return  # already wrote this step (e.g. finalize_run after a triggered write)
+        acceptance_ratios = self.move_selector.interval_ratios()
+        # Reset before the disabled-outfile bail-out: the counters are
+        # per-write-interval, so skipping the reset when there is nothing to
+        # write turns interval_ratios() into total_ratios() for the rest of
+        # the run.
+        self.move_selector.reset_counters()
+        if self._outfile is None or self._outfile_handle is None:
+            self._last_logged_step = self._step
+            return
+        ratio_str = ", ".join(
+            f"{r * 100:.1f}%" if not np.isnan(r) else "N/A"
+            for r in acceptance_ratios
+        )
+        try:
+            self._outfile_handle.write(self._row(ratio_str) + "\n")
+            self._outfile_handle.flush()
+            self._last_logged_step = self._step
+        except (OSError, AttributeError):
+            self.logger.exception("Error writing to file %s", self._outfile)
+
+    def _species_count(self, atoms: Atoms, specie: str) -> int:
+        """Particle count for one μ species: molecules for molecular keys,
+        atoms otherwise. The one counting convention shared by
+        ``_minimum_score`` and the replica-exchange swap criterion."""
+        if specie in self.units.molecules:
+            template = self.units.molecules[specie]
+            return len(find_molecules(
+                atoms, sorted(template.get_chemical_symbols())))
+        return atoms.get_chemical_symbols().count(specie)
+
+    def _minimum_score(self, atoms: Atoms, energy: float) -> float:
+        """Grand potential Ω = E − Σ μ_i N_i. Comparing raw E across moves
+        that change N is not meaningful in the grand canonical ensemble.
+        Molecular species count molecules, atomic species count atoms."""
+        score = energy
+        for specie, mu in self._mu.items():
+            score -= mu * self._species_count(atoms, specie)
+        return score
+
+    def _acceptance_condition(self,
+                              potential_diff: float,
+                              delta_particles: int,
+                              volume: float,
+                              species: str,
+                              n_atoms: int = None) -> bool:
+        """Metropolis / de-Broglie acceptance test for displacement, insertion,
+        and deletion moves. ``n_atoms`` is the particle count fed to the de
+        Broglie combinatorial factor. Atomic moves pass the pre-move total
+        atom count (the original convention, kept for consistency with the
+        group's published runs); molecule moves pass their pre-move in-cell
+        molecule count via ``MoveSelector.get_exchange_count()`` -- see
+        docs/gcmc_acceptance_convention.rst."""
+        if delta_particles == 0:
+            if potential_diff <= 0:
+                return True
+            p = np.exp(-potential_diff * self.units.beta)
+            return p > self.rng_acceptance.get_uniform()
+
+        if delta_particles == 1:  # insertion
+            db_term = self.units.de_broglie_insertion(volume, n_atoms, species)
+            exp_term = np.exp(-self.units.beta * (potential_diff - self._mu[species]))
+            p = db_term * exp_term
+            self.logger.debug(
+                "Lambda_db: %.3e, p: %.3e, Beta: %.3e, Exp: %.3e, "
+                "Exp Arg %s, Potential diff: %.3e, Delta_particles: %d",
+                self.units.lambda_dbs[species], p, self.units.beta, exp_term,
+                potential_diff - self._mu[species], potential_diff, delta_particles)
+        elif delta_particles == -1:  # deletion
+            db_term = self.units.de_broglie_deletion(volume, n_atoms, species)
+            exp_term = np.exp(-self.units.beta * (potential_diff + self._mu[species]))
+            p = db_term * exp_term
+            self.logger.debug(
+                "Lambda_db: %.3e, p: %.3e, Beta: %.3e, Exp: %.3e, "
+                "Exp Arg %s, Potential diff: %.3e, Delta_particles: %d",
+                self.units.lambda_dbs[species], p, self.units.beta, exp_term,
+                potential_diff + self._mu[species], potential_diff, delta_particles)
+        else:
+            raise ValueError(
+                f"unexpected delta_particles={delta_particles} from move "
+                f"'{self.move_selector.get_name()}'"
+            )
+
+        if p > 1:
+            return True
+        return p > self.rng_acceptance.get_uniform()
+
+    def _restore(self, snapshot) -> None:
+        """Put the configuration back as it was before the trial move."""
+        arrays, constraints = snapshot
+        self.atoms.arrays = arrays
+        self.atoms.set_constraint(constraints)
+
+    def _propose(self):
+        """Run one trial move in place. Returns ``(snapshot, meta)``, or
+        ``None`` when the move could not propose (already rolled back).
+
+        Split out of :meth:`do_gcmc_step` so ``BatchedReplicaExchange`` runs
+        the identical proposal step: it has to propose on every replica before
+        it can score any of them in one batched forward pass.
+
+        The snapshot holds ``atoms.arrays`` (positions, numbers, ...) plus the
+        constraints. Restoring it on rejection also undoes any in-place
+        relaxation ``compute_energy`` did. The constraints are part of it
+        because ``del atoms[i]`` remaps FixAtoms indices in place (ASE
+        ``delete_atoms``), so a rejected deletion would otherwise leave the
+        restored configuration with shifted fixed indices -- wrong atoms frozen
+        from then on.
+        """
+        atoms = self.atoms
+        snapshot = ({k: v.copy() for k, v in atoms.arrays.items()},
+                    [c.copy() for c in atoms.constraints])
+
+        atoms_new, delta_particles, species = self.move_selector.do_trial_move(atoms)
+
+        if atoms_new is False or atoms_new is None:
+            # Move couldn't be proposed (e.g. empty cell). MoveSelector already
+            # recorded the failure so it won't depress the acceptance ratio.
+            # Identity check, not truthiness: an empty Atoms (last atom
+            # deleted) is falsy but is a real proposal that must be scored.
+            #
+            # Restore rather than trust the sentinel to mean "nothing was
+            # touched": a move that mutates before bailing would otherwise
+            # leave the configuration changed while ``E_old`` still describes
+            # the previous one.
+            self._restore(snapshot)
+            return None
+
+        if atoms_new is not atoms:
+            raise RuntimeError(
+                f"move '{self.move_selector.get_name()}' returned a "
+                "different Atoms object; GCMC moves must mutate the "
+                "passed atoms in place (copy-based moves are for "
+                "CanonicalEnsemble only)"
+            )
+        return snapshot, (delta_particles, species)
+
+    def _is_accepted(self, E_new: float, meta) -> bool:
+        """Acceptance test for the pending proposal. Changes no state other
+        than drawing from the acceptance RNG.
+
+        Split out of :meth:`_commit_or_rollback` so ``ParallelGCMC`` can
+        decide on every rank first and commit only the winning proposal."""
+        delta_particles, species = meta
+        delta_E = E_new - self.E_old
+        volume = self.move_selector.get_volume()
+        # de Broglie particle count. Molecule moves report their in-cell
+        # molecule count via ``get_exchange_count`` (textbook convention);
+        # atomic moves return None and fall back to the total atom count
+        # before the move (``self.n_atoms`` is updated only on acceptance).
+        # See docs/gcmc_acceptance_convention.rst.
+        n_exchange = self.move_selector.get_exchange_count()
+        if n_exchange is None:
+            n_exchange = self.n_atoms
+        return self._acceptance_condition(delta_E, delta_particles, volume,
+                                          species, n_exchange)
+
+    def _commit(self, E_new: float) -> None:
+        """Make the pending (accepted) proposal the current state."""
+        if self._wrap_on_accept:
+            self.atoms.wrap()
+        self.n_atoms = len(self.atoms)
+        self.E_old = E_new
+        self.calculate_cells_volume(self.atoms)
+
+    def _commit_or_rollback(self, E_new: float, snapshot, meta) -> bool:
+        """Score the pending proposal and either keep it or restore the
+        snapshot. Returns whether it was accepted."""
+        if not self._is_accepted(E_new, meta):
+            self._restore(snapshot)
+            return False
+
+        delta_particles, species = meta
+        volume = self.move_selector.get_volume()
+        self._commit(E_new)
+        self.move_selector.acceptance_counter()
+        self._record_minimum(self.atoms, self.E_old)
+        self.logger.debug("Volume: %.3f, Delta_particles: %d, Species: %s",
+                          volume, delta_particles, species)
+        return True
+
+    def do_gcmc_step(self) -> None:
+        for _ in range(self.move_selector.n_moves):
+            proposal = self._propose()
+            if proposal is None:
+                continue
+            snapshot, meta = proposal
+            self._commit_or_rollback(self.compute_energy(self.atoms),
+                                     snapshot, meta)
+
+    def initialize_run(self) -> None:
+        """Open files, write headers, log start, write initial state."""
+        if self._initialized:
+            return
+        super().initialize_run()
+        self.initialize_outfile()
+        self.logger.info(
+            "GCMC starting: T=%s K, mu=%s, outfile=%s",
+            self._temperature, self._mu, self._outfile,
+        )
+        # Initial frame (step 0) for both outfile and trajectory so the
+        # logged sequence is symmetric and the starting state is recoverable.
+        self._write_initial_row()
+        self.write_coordinates(self.atoms, self.E_old)
+        self._record_minimum(self.atoms, self.E_old)
+
+    def _write_initial_row(self) -> None:
+        if self._outfile is None or self._outfile_handle is None:
+            return
+        try:
+            placeholder = ", ".join("N/A" for _ in self.move_selector.move_list)
+            self._outfile_handle.write(self._row(placeholder) + "\n")
+            self._outfile_handle.flush()
+            self._last_logged_step = 0
+        except (OSError, AttributeError):
+            self.logger.exception("Error writing initial row to %s", self._outfile)
+
+    def finalize_run(self) -> None:
+        if not self._initialized:
+            return
+        # Write the trailing row + frame so the log/traj end on the actual
+        # final state regardless of write_interval alignment.
+        self.write_outfile()
+        self.write_coordinates(self.atoms, self.E_old)
+        self.logger.info(
+            "GCMC complete: steps=%d, final_energy=%.6f eV",
+            self._step, self.E_old,
+        )
+        super().finalize_run()
+
+    def _run(self) -> None:
+        """One GCMC step plus interval-based writes. Step counter is
+        incremented BEFORE the modulo check so the logged step is the number
+        of GCMC steps completed."""
+        t0 = time.perf_counter()
+        self.do_gcmc_step()
+        self._step += 1
+        self._last_step_seconds = time.perf_counter() - t0
+
+        if self._step % self._outfile_write_interval == 0:
+            self.write_outfile()
+            self.logger.info("step=%d N=%d E=%.6f t=%.2fs",
+                             self._step, self.n_atoms, self.E_old,
+                             self._last_step_seconds)
+
+        if self._step % self._trajectory_write_interval == 0:
+            self.write_coordinates(self.atoms, self.E_old)

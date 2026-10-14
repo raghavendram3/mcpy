@@ -32,4 +32,9 @@ selects the constants its de Broglie factors are built from; see
 .. autoclass:: mcpy.ensembles.batched_replica_exchange.BatchedReplicaExchange
    :members:
 
+.. autoclass:: mcpy.ensembles.parallel_gcmc.ParallelGCMC
+   :members: run
+
+.. autofunction:: mcpy.ensembles.parallel_gcmc.reseed_ensemble
+
 .. autofunction:: mcpy.ensembles.base_ensemble.write_xyz

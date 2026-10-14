@@ -12,6 +12,7 @@ top of the file. Edit and re-run.
 | `02_molecule_gcmc.py` | Molecular adsorbates: rigid insertion, deletion and translate+rotate moves, `molecule_id` bookkeeping. Lennard-Jones dimers. | ASE only | ~20 s |
 | `03_gcmc_surface_mace.py` | A production run: O and Ag both exchanged on an Ag(111) surface (one cell per species) with a machine-learned potential, FIRE relaxation, and chemical potentials derived from the potential itself. | `nvalchemi-toolkit[mace]`, GPU | hours |
 | `04_replica_exchange_batched.py` | Replica exchange on one GPU, with every replica's trial energy evaluated in a single batched forward pass. | `nvalchemi-toolkit[mace]`, GPU | hours |
+| `05_parallel_gcmc_nanoparticle.py` | Oxygen uptake of a Pt nanoparticle at fixed mu_O on many CPU cores: `ParallelGCMC` runs independent walkers, each evaluating trial moves on several MPI ranks at once (exact), and pools <N_O> with error bars. `slurm_parallel_gcmc.sh` submits it on 192-core nodes. | `mpi4py`, `mace-torch` (or EMT for testing) | hours |
 
 The first three use toy potentials (Lennard-Jones, EMT) on purpose: they run
 anywhere and their reference values are known. Real chemistry needs a real

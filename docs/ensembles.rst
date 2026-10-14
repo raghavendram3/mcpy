@@ -6,7 +6,7 @@ configuration, the energy calculator, the set of cells used for free-volume esti
 the `MoveSelector` that proposes trial configurations. It then evaluates the appropriate
 acceptance rule and writes the trajectory and log.
 
-Four ensembles are available:
+Five ensembles are available:
 
 - :class:`CanonicalEnsemble` -- fixed composition (NVT) Metropolis sampling.
 - :class:`GrandCanonicalEnsemble` -- variable composition at fixed :math:`(\mu, V, T)`.
@@ -14,6 +14,9 @@ Four ensembles are available:
   temperatures or chemical potentials and periodically attempts exchanges between them.
 - :class:`BatchedReplicaExchange` -- single-process variant that batches every replica's
   trial-move energy into a single forward pass (one GPU context, one kernel launch per layer).
+- :class:`ParallelGCMC` -- an MPI driver for one GCMC setup at fixed :math:`\mu` on many CPU
+  cores: independent walkers, each evaluating trial moves on several ranks at once
+  (exact; see :doc:`parallel_gcmc`).
 
 All ensembles share a basin-hopping-style *running minimum* output: whenever a strictly
 lower-score configuration is observed, it is appended to (or overwrites) a dedicated
